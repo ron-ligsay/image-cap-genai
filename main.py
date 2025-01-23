@@ -1,11 +1,14 @@
 import os
 import uuid
-from flask import Flask, request, jsonify
-from google.cloud import storage, vision_v1 as vision_v1
 import time
+import json
+import logging
+import sys
+from flask import Flask, request, jsonify, render_template
+from google.cloud import storage, vision_v1 as vision
 from google.api_core.exceptions import Conflict
-import sys, json, logging
 
+# Logger setup
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         json_log_object = {
@@ -21,103 +24,94 @@ sh.setFormatter(JsonFormatter())
 logger.addHandler(sh)
 logger.setLevel(logging.DEBUG)
 
+# Flask app initialization
 app = Flask(__name__)
 
-BUCKET_NAME = image-cap-bucket
+# Google Cloud Storage and Vision API setup
+BUCKET_NAME = "image-cap-bucket"
+vision_client = vision.ImageAnnotatorClient()
+storage_client = storage.Client()
 
-vision_client = vision.ImageAnnotationClient()
-
+# Retry IAM binding function
 def add_bucket_iam_binding_with_retries(bucket_name, member, role, retries=5):
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    
+    bucket = storage_client.bucket(bucket_name)
     for i in range(retries):
         try:
             policy = bucket.get_iam_policy(requested_policy_version=3)
             policy.bindings.append({"role": role, "members": {member}})
             bucket.set_iam_policy(policy)
-            print("IAM policy updated successfully.")
+            logger.info("IAM policy updated successfully.")
             return
         except Conflict as e:
-            print(f"Conflict encountered: {e}. Retrying...")
+            logger.warning(f"Conflict encountered: {e}. Retrying...")
             time.sleep(2 ** i)  # Exponential backoff
-    print("Failed to update IAM policy after retries.")
+    logger.error("Failed to update IAM policy after retries.")
+    raise RuntimeError("Could not set IAM policy.")
 
+# Upload file to GCP bucket
 def upload_to_bucket(file, filename):
-    """Upload a file to Google Cloud Storage"""
-    json_fields = {"filename": filename}
-    logger.debug("Upload to bucket", extra={"json_fields": json_fields})
     bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(filename)
     blob.upload_from_file(file)
-    logger.debug(f"{filename} Uploaded to bucket")
+    logger.info(f"Uploaded {filename} to bucket.")
     return blob.public_url
 
+# Generate image caption
 def generate_caption(image_url):
-    """Generate an image caption using Google Cloud Vision API"""
-    logger.debug("Generating Caption")
+    logger.debug("Generating caption for image.")
     image = vision.Image()
     image.source.image_uri = image_url
 
-    reponse = vision.client.label_detection(image=image)
-    labels = reponse.label_annotations
+    response = vision_client.label_detection(image=image)
+    labels = response.label_annotations
 
-    if reponse.error.message:
-        logger.exception("Vision API Error")
-        raise Exception(f"Vision API Error: {reponse.error.message}")
+    if response.error.message:
+        logger.error("Vision API Error")
+        raise Exception(f"Vision API Error: {response.error.message}")
 
-    # Generate a caption usign the top labels
-    top_labels = [label.description for label in lables[:3]]
-    caption = f"This image likely contains: {', '.joins(top_labels)}."
-    logger.debug(f"Caption Generated: {caption}")
+    top_labels = [label.description for label in labels[:3]]
+    caption = f"This image likely contains: {', '.join(top_labels)}."
+    logger.info(f"Generated caption: {caption}")
     return caption
 
+# Routes
 @app.route("/", methods=["GET"])
 def index():
-    """Render the upload page."""
     return render_template("index.html")
-
 
 @app.route("/upload", methods=["POST"])
 def upload_image():
-    """Handle image upload and caption generation."""
     if "image" not in request.files:
-        logger.warning("Error No Image file provided")
+        logger.warning("No image file provided.")
         return jsonify({"error": "No image file provided."}), 400
 
     image_file = request.files["image"]
     filename = f"images/{uuid.uuid4()}.jpg"
-    logger.debug(f"File name: {filename}")
+    logger.info(f"Processing file: {filename}")
 
     try:
-        # Upload the file to Google Cloud Storage
         image_url = upload_to_bucket(image_file, filename)
-
-        # Generate a caption for the uploaded image
         caption = generate_caption(image_url)
-
-        json_fields = {"image_url": image_url, "caption": caption}
-        logger.debug("Result of Image Caption Generation", extra={"json_fields": json_fields})
-        return jsonify(json_fields)
+        result = {"image_url": image_url, "caption": caption}
+        logger.info("Caption generation successful.", extra={"json_fields": result})
+        return jsonify(result)
     except Exception as e:
+        logger.error(f"Error generating caption: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Health check endpoint."""
     return jsonify({"status": "OK"})
 
+# Main
 if __name__ == "__main__":
-    # Set IAM policy for the bucket before starting the app
-    MEMBER = "allUsers"  # Public access
-    ROLE = "roles/storage.objectViewer"  # Allow read access
+    MEMBER = "allUsers"
+    ROLE = "roles/storage.objectViewer"
 
     try:
         add_bucket_iam_binding_with_retries(BUCKET_NAME, MEMBER, ROLE)
-        print("Bucket permissions are set.")
     except Exception as e:
-        print(f"Failed to set bucket permissions: {e}")
-    
-    # Start the Flask app
+        logger.error(f"Failed to set bucket permissions: {e}")
+        sys.exit(1)
+
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
