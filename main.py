@@ -2,6 +2,8 @@ import os
 import uuid
 from flask import Flask, request, jsonify
 from google.cloud import storage, vision_v1 as vision_v1
+import time
+from google.api_core.exceptions import Conflict
 import sys, json, logging
 
 class JsonFormatter(logging.Formatter):
@@ -24,6 +26,22 @@ app = Flask(__name__)
 BUCKET_NAME = image-cap-bucket
 
 vision_client = vision.ImageAnnotationClient()
+
+def add_bucket_iam_binding_with_retries(bucket_name, member, role, retries=5):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    
+    for i in range(retries):
+        try:
+            policy = bucket.get_iam_policy(requested_policy_version=3)
+            policy.bindings.append({"role": role, "members": {member}})
+            bucket.set_iam_policy(policy)
+            print("IAM policy updated successfully.")
+            return
+        except Conflict as e:
+            print(f"Conflict encountered: {e}. Retrying...")
+            time.sleep(2 ** i)  # Exponential backoff
+    print("Failed to update IAM policy after retries.")
 
 def upload_to_bucket(file, filename):
     """Upload a file to Google Cloud Storage"""
@@ -91,4 +109,15 @@ def health_check():
     return jsonify({"status": "OK"})
 
 if __name__ == "__main__":
+    # Set IAM policy for the bucket before starting the app
+    MEMBER = "allUsers"  # Public access
+    ROLE = "roles/storage.objectViewer"  # Allow read access
+
+    try:
+        add_bucket_iam_binding_with_retries(BUCKET_NAME, MEMBER, ROLE)
+        print("Bucket permissions are set.")
+    except Exception as e:
+        print(f"Failed to set bucket permissions: {e}")
+    
+    # Start the Flask app
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
